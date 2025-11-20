@@ -188,6 +188,7 @@ class MidTermMemory:
         self.save()
         return session_id
     
+    
     def rebuild_heap(self):
         self.heap = []
         for sid, session_data in self.sessions.items():
@@ -394,12 +395,18 @@ class MidTermMemory:
         # Make a copy for saving to avoid modifying heap during iteration if it happens
         # Though current heap is list of tuples, so direct modification risk is low
         # sessions_to_save = {sid: data for sid, data in self.sessions.items()}
+        
+        # 从 graph_layer 获取 [[u, v, w], ...] 格式的列表
+        edges_to_save = self.graph_layer.get_edges_serializable()
+        
         data_to_save = {
             "sessions": self.sessions,
             "access_frequency": dict(self.access_frequency), # Convert defaultdict to dict for JSON
+            "graph_edges": edges_to_save ,
             # Heap is derived, no need to save typically, but can if desired for faster load
             # "heap_snapshot": self.heap 
         }
+                
         try:
             with open(self.file_path, "w", encoding="utf-8") as f:
                 json.dump(data_to_save, f, ensure_ascii=False, indent=2)
@@ -413,6 +420,21 @@ class MidTermMemory:
                 self.sessions = data.get("sessions", {})
                 self.access_frequency = defaultdict(int, data.get("access_frequency", {}))
                 self.rebuild_heap() # Rebuild heap from loaded sessions
+                self.graph_layer = GraphMemoryLayer(similarity_threshold=self.graph_layer.similarity_threshold)
+                
+                for sid, session_data in self.sessions.items():
+                    emb = session_data.get("summary_embedding")
+                    if emb:
+                        # 使用 restore_node_no_sim 避免 O(N^2) 的相似度计算
+                        self.graph_layer.restore_node_no_sim(sid, emb)
+                # 重建图：恢复边
+                saved_edges = data.get("graph_edges", [])
+                if saved_edges:
+                    self.graph_layer.load_edges_from_list(saved_edges)
+                
+                self.rebuild_heap()
+            
+            print(f"MidTermMemory: Loaded from {self.file_path}. Sessions: {len(self.sessions)}. Graph Edges: {len(saved_edges)}.")
             print(f"MidTermMemory: Loaded from {self.file_path}. Sessions: {len(self.sessions)}.")
         except FileNotFoundError:
             print(f"MidTermMemory: No history file found at {self.file_path}. Initializing new memory.")
@@ -435,59 +457,71 @@ class GraphMemoryLayer:
 
     def add_node(self, session_id, embedding):
         """
-        添加新的 Session 节点，并与现有 Session 建立基于相似度的边
+        添加新节点，并计算与现有节点的相似度进行连边 (用于新Session进入时)
         """
-        # 1. 添加节点 (将 embedding 存入节点属性，方便后续计算)
-        # embedding 应该是 list 或 numpy array
+        # 1. 格式化 Embedding
         if isinstance(embedding, list):
             embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
         elif len(embedding.shape) == 1:
             embedding = embedding.reshape(1, -1)
             
+        # 2. 添加节点
         self.graph.add_node(session_id, embedding=embedding)
         
-        # 2. 获取图中其他已有节点
+        # 3. 寻找现有节点
         existing_nodes = [n for n in self.graph.nodes() if n != session_id]
         if not existing_nodes:
             return
 
-        # 3. 批量计算相似度 (Vectorized operation)
-        # 提取所有现有节点的 embedding
+        # 4. 计算相似度
         existing_embeddings = np.vstack([self.graph.nodes[n]['embedding'] for n in existing_nodes])
-        
-        # 计算余弦相似度: (1, dim) x (N, dim).T -> (1, N)
         sim_scores = cosine_similarity(embedding, existing_embeddings)[0]
         
-        # 4. 超过阈值则连边
+        # 5. 连边
         for idx, score in enumerate(sim_scores):
             if score > self.similarity_threshold:
                 target_node = existing_nodes[idx]
+                # weight 必须转为 float，否则 numpy float 可能导致 json 序列化报错
                 self.graph.add_edge(session_id, target_node, weight=float(score))
 
     def remove_node(self, session_id):
-        """当 Session 被驱逐时，从图中移除节点"""
         if self.graph.has_node(session_id):
             self.graph.remove_node(session_id)
 
     def get_neighbor_ids(self, session_ids):
-        """获取一组 Session ID 的直接邻居 ID"""
         neighbors = set()
         for sid in session_ids:
             if self.graph.has_node(sid):
-                curr_neighbors = list(self.graph.neighbors(sid))
-                neighbors.update(curr_neighbors)
-        
-        # 移除输入本身 (以免返回自己)
+                neighbors.update(self.graph.neighbors(sid))
+        # 排除自己
         for sid in session_ids:
             if sid in neighbors:
                 neighbors.remove(sid)
-                
         return list(neighbors)
     
-    def get_edges_list(self):
-        """导出边列表用于保存 (u, v, weight)"""
-        return list(self.graph.edges(data="weight"))
+    def get_edges_serializable(self):
+        """
+        [关键] 返回用于 JSON 存储的列表格式: [[u, v, weight], ...]
+        """
+        edges_data = []
+        for u, v, data in self.graph.edges(data=True):
+            w = data.get('weight', 0.0)
+            edges_data.append([u, v, w])
+        return edges_data
 
     def load_edges_from_list(self, edges_list):
-        """从保存的列表恢复边"""
+        """
+        从 JSON 列表恢复边
+        """
+        if not edges_list:
+            return
+        # networkx add_weighted_edges_from 接受 (u, v, w) 元组列表
         self.graph.add_weighted_edges_from(edges_list)
+
+    def restore_node_no_sim(self, session_id, embedding):
+        """
+        [关键] Load 专用：仅恢复节点，不计算相似度（避免 Load 时 O(N^2) 计算）
+        """
+        if isinstance(embedding, list):
+            embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        self.graph.add_node(session_id, embedding=embedding)
