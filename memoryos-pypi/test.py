@@ -5,10 +5,11 @@ from memoryos import Memoryos
 # --- Basic Configuration ---
 USER_ID = "demo_user"
 ASSISTANT_ID = "demo_assistant"
-API_KEY = ""  # Replace with your key
-BASE_URL = ""  # Optional: if using a custom OpenAI endpoint
-DATA_STORAGE_PATH = ""
+API_KEY = "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"  # Replace with your key
+BASE_URL = "https://openrouter.ai/api/v1"  # Optional: if using a custom OpenAI endpoint
+DATA_STORAGE_PATH = "data_memoryos_demo"
 LLM_MODEL = "gpt-4o-mini"
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 def simple_demo():
     print("MemoryOS Simple Demo")
@@ -28,7 +29,8 @@ def simple_demo():
             retrieval_queue_capacity=10,
             long_term_knowledge_capacity=100,
             mid_term_similarity_threshold=0.6,
-            embedding_model_name=""
+            embedding_model_name=EMBEDDING_MODEL_NAME
+            
         )
         print("MemoryOS initialized successfully!\n")
     except Exception as e:

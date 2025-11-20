@@ -41,6 +41,25 @@ class Retriever:
             top_k_sessions=top_k_sessions
         )
         
+        # [新增] Graph RAG 增强：获取这些 Top Session 的邻居
+        top_session_ids = [s["session_id"] for s in matched_sessions]
+        neighbor_sessions = self.mid_term_memory.get_direct_neighbors(top_session_ids)
+        
+        # [新增] 合并上下文 (去重)
+        seen_ids = set([s["session_id"] for s in matched_sessions+neighbor_sessions])
+        final_context_sessions = matched_sessions # 这里是 search_sessions 返回的特定格式
+        for ns in neighbor_sessions:
+            if ns['id'] not in seen_ids:
+                # 将 neighbor session 转换为 search_results 相同的格式以便统一处理
+                final_context_sessions.append({
+                    "session_id": ns['id'],
+                    "session_summary": ns['summary'],
+                    "session_relevance_score": 0.5, # 邻居赋予一个默认权重，或使用边的 weight
+                    "matched_pages": [] # 邻居通常意味着整个 session 都相关，或者需要进一步过滤
+                })
+                seen_ids.add(ns['id'])
+        
+        
         # Use a heap to get top N pages across all relevant sessions based on their scores
         top_pages_heap = []
         page_counter = 0  # Add counter to ensure unique comparison

@@ -47,6 +47,11 @@ class MidTermMemory:
         self.embedding_model_name = embedding_model_name
         self.embedding_model_kwargs = embedding_model_kwargs if embedding_model_kwargs is not None else {}
         self.load()
+        
+        # added
+        self.graph_layer = GraphMemoryLayer(similarity_threshold=0.8)
+        self.load()
+
 
     def get_page_by_id(self, page_id):
         for session in self.sessions.values():
@@ -81,6 +86,9 @@ class MidTermMemory:
         session_to_delete = self.sessions.pop(lfu_sid) # Remove from sessions
         del self.access_frequency[lfu_sid] # Remove from LFU tracking
 
+        # [Graph Mod] 同步从图中移除节点，防止产生悬空边
+        self.graph_layer.remove_node(lfu_sid)
+        
         # Clean up page connections if this session's pages were linked
         for page in session_to_delete.get("details", []):
             prev_page_id = page.get("pre_page")
@@ -170,12 +178,16 @@ class MidTermMemory:
         self.access_frequency[session_id] = 0 # Initialize for LFU
         heapq.heappush(self.heap, (-session_obj["H_segment"], session_id)) # Use negative heat for max-heap behavior
         
+        # [Graph Mod] 将新 Session 作为节点加入图，并计算相似度建立连接
+        # 注意：graph_layer.add_node 内部会计算 cosine similarity 并连边
+        self.graph_layer.add_node(session_id, np.array(summary_vec))
+        
         print(f"MidTermMemory: Added new session {session_id}. Initial heat: {session_obj['H_segment']:.2f}.")
         if len(self.sessions) > self.max_capacity:
             self.evict_lfu()
         self.save()
         return session_id
-
+    
     def rebuild_heap(self):
         self.heap = []
         for sid, session_data in self.sessions.items():
@@ -275,7 +287,8 @@ class MidTermMemory:
         else:
             print(f"MidTermMemory: No suitable session to merge (best score {best_overall_score:.2f} < threshold {similarity_threshold}). Creating new session.")
             return self.add_session(summary_for_new_pages, pages_to_insert, keywords_for_new_pages)
-
+    
+    
     def search_sessions(self, query_text, segment_similarity_threshold=0.1, page_similarity_threshold=0.1, 
                           top_k_sessions=5, keyword_alpha=1.0, recency_tau_search=3600):
         if not self.sessions:
@@ -359,6 +372,24 @@ class MidTermMemory:
         # Sort final results by session_relevance_score
         return sorted(results, key=lambda x: x["session_relevance_score"], reverse=True)
 
+    def get_direct_neighbors(self, session_ids):
+        """
+        [Graph Mod] 获取指定 sessions 的直接邻居 session 对象
+        """
+        # 1. 从图层获取邻居 ID
+        neighbor_ids = self.graph_layer.get_neighbor_ids(session_ids)
+        
+        # 2. 根据 ID 从 self.sessions 中检索完整对象
+        neighbor_sessions = []
+        for nid in neighbor_ids:
+            if nid in self.sessions:
+                neighbor_sessions.append(self.sessions[nid])
+            else:
+                # 如果图里有ID但sessions里没有，说明数据不一致（通常由evict导致），需要清理
+                self.graph_layer.remove_node(nid)
+        
+        return neighbor_sessions
+    
     def save(self):
         # Make a copy for saving to avoid modifying heap during iteration if it happens
         # Though current heap is list of tuples, so direct modification risk is low
@@ -389,3 +420,74 @@ class MidTermMemory:
             print(f"MidTermMemory: Error decoding JSON from {self.file_path}. Initializing new memory.")
         except Exception as e:
             print(f"MidTermMemory: An unexpected error occurred during load from {self.file_path}: {e}. Initializing new memory.") 
+    
+            
+            
+            
+import networkx as nx
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+
+class GraphMemoryLayer:
+    def __init__(self, similarity_threshold=0.75):
+        self.graph = nx.Graph()
+        self.similarity_threshold = similarity_threshold
+
+    def add_node(self, session_id, embedding):
+        """
+        添加新的 Session 节点，并与现有 Session 建立基于相似度的边
+        """
+        # 1. 添加节点 (将 embedding 存入节点属性，方便后续计算)
+        # embedding 应该是 list 或 numpy array
+        if isinstance(embedding, list):
+            embedding = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        elif len(embedding.shape) == 1:
+            embedding = embedding.reshape(1, -1)
+            
+        self.graph.add_node(session_id, embedding=embedding)
+        
+        # 2. 获取图中其他已有节点
+        existing_nodes = [n for n in self.graph.nodes() if n != session_id]
+        if not existing_nodes:
+            return
+
+        # 3. 批量计算相似度 (Vectorized operation)
+        # 提取所有现有节点的 embedding
+        existing_embeddings = np.vstack([self.graph.nodes[n]['embedding'] for n in existing_nodes])
+        
+        # 计算余弦相似度: (1, dim) x (N, dim).T -> (1, N)
+        sim_scores = cosine_similarity(embedding, existing_embeddings)[0]
+        
+        # 4. 超过阈值则连边
+        for idx, score in enumerate(sim_scores):
+            if score > self.similarity_threshold:
+                target_node = existing_nodes[idx]
+                self.graph.add_edge(session_id, target_node, weight=float(score))
+
+    def remove_node(self, session_id):
+        """当 Session 被驱逐时，从图中移除节点"""
+        if self.graph.has_node(session_id):
+            self.graph.remove_node(session_id)
+
+    def get_neighbor_ids(self, session_ids):
+        """获取一组 Session ID 的直接邻居 ID"""
+        neighbors = set()
+        for sid in session_ids:
+            if self.graph.has_node(sid):
+                curr_neighbors = list(self.graph.neighbors(sid))
+                neighbors.update(curr_neighbors)
+        
+        # 移除输入本身 (以免返回自己)
+        for sid in session_ids:
+            if sid in neighbors:
+                neighbors.remove(sid)
+                
+        return list(neighbors)
+    
+    def get_edges_list(self):
+        """导出边列表用于保存 (u, v, weight)"""
+        return list(self.graph.edges(data="weight"))
+
+    def load_edges_from_list(self, edges_list):
+        """从保存的列表恢复边"""
+        self.graph.add_weighted_edges_from(edges_list)
