@@ -5,7 +5,7 @@ from memoryos import Memoryos
 # --- Basic Configuration ---
 USER_ID = "demo_user"
 ASSISTANT_ID = "demo_assistant"
-API_KEY = "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"  # Replace with your key
+API_KEY = ""  # Replace with your key
 BASE_URL = "https://openrouter.ai/api/v1"  # Optional: if using a custom OpenAI endpoint
 DATA_STORAGE_PATH = "data_memoryos_demo"
 LLM_MODEL = "gpt-4o-mini"
